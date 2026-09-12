@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "author": "Distance Traffic-Light Indicator",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp32", "top": 200, "left": 700, "attrs": {} },
+
+    { "type": "wokwi-hc-sr04", "id": "sensorTop",   "top": -80,  "left": 150, "attrs": { "distance": "100" } },
+    { "type": "wokwi-hc-sr04", "id": "sensorLeft",  "top": 200, "left": -150, "attrs": { "distance": "100" } },
+    { "type": "wokwi-hc-sr04", "id": "sensorRight", "top": 200, "left": 400,  "attrs": { "distance": "100" } },
+
+    { "type": "wokwi-hc-sr04", "id": "bay2Top",   "top": -80,  "left": 1250, "attrs": { "distance": "100" } },
+    { "type": "wokwi-hc-sr04", "id": "bay2Left",  "top": 200, "left": 1000, "attrs": { "distance": "100" } },
+    { "type": "wokwi-hc-sr04", "id": "bay2Right", "top": 200, "left": 1500, "attrs": { "distance": "100" } },
+
+    { "type": "wokwi-rgb-led", "id": "led", "top": 430, "left": 150, "attrs": { "common": "cathode" } },
+    { "type": "wokwi-resistor", "id": "rR", "top": 410, "left": 90, "rotate": 90, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "rG", "top": 440, "left": 90, "rotate": 90, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "rB", "top": 470, "left": 90, "rotate": 90, "attrs": { "value": "220" } },
+
+    { "type": "wokwi-rgb-led", "id": "led2", "top": 430, "left": 1250, "attrs": { "common": "cathode" } },
+    { "type": "wokwi-resistor", "id": "r2R", "top": 410, "left": 1190, "rotate": 90, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "r2G", "top": 440, "left": 1190, "rotate": 90, "attrs": { "value": "220" } },
+
+    { "type": "board-bmp180", "id": "plate", "top": 600, "left": 400, "attrs": { "pressure": "101325" } },
+    { "type": "wokwi-text", "id": "labelEntry", "top": 545, "left": 385, "attrs": { "text": "ENTRY\n(arriving car)" } },
+
+    { "type": "board-bmp180", "id": "plateExit", "top": 600, "left": 550, "attrs": { "pressure": "101325" } },
+    { "type": "wokwi-text", "id": "labelExit", "top": 545, "left": 545, "attrs": { "text": "EXIT\n(departing car)" } },
+    { "type": "wokwi-servo", "id": "gateServo", "top": 600, "left": 700, "attrs": {} },
+    { "type": "wokwi-buzzer", "id": "buzzer", "top": 600, "left": 900, "attrs": { "volume": "0.2" } },
+    { "type": "wokwi-buzzer", "id": "buzzer2", "top": 700, "left": 900, "attrs": { "volume": "0.2" } },
+
+    { "type": "wokwi-led", "id": "gateLed", "top": 700, "left": 700, "attrs": { "color": "red" } },
+    { "type": "wokwi-resistor", "id": "rGate", "top": 700, "left": 640, "rotate": 90, "attrs": { "value": "220" } }
+  ],
+  "connections": [
+    ["sensorTop:VCC", "esp32:VIN", "red", []],
+    ["sensorTop:GND", "esp32:GND.1", "black", []],
+    ["sensorTop:TRIG", "esp32:D33", "green", []],
+    ["sensorTop:ECHO", "esp32:VP", "yellow", []],
+
+    ["sensorLeft:VCC", "esp32:VIN", "red", []],
+    ["sensorLeft:GND", "esp32:GND.1", "black", []],
+    ["sensorLeft:TRIG", "esp32:D25", "green", []],
+    ["sensorLeft:ECHO", "esp32:VP", "yellow", []],
+
+    ["sensorRight:VCC", "esp32:VIN", "red", []],
+    ["sensorRight:GND", "esp32:GND.2", "black", []],
+    ["sensorRight:TRIG", "esp32:D27", "green", []],
+    ["sensorRight:ECHO", "esp32:VP", "yellow", []],
+
+    ["bay2Top:VCC", "esp32:VIN", "red", []],
+    ["bay2Top:GND", "esp32:GND.1", "black", []],
+    ["bay2Top:TRIG", "esp32:D15", "green", []],
+    ["bay2Top:ECHO", "esp32:VP", "yellow", []],
+
+    ["bay2Left:VCC", "esp32:VIN", "red", []],
+    ["bay2Left:GND", "esp32:GND.1", "black", []],
+    ["bay2Left:TRIG", "esp32:D2", "green", []],
+    ["bay2Left:ECHO", "esp32:VP", "yellow", []],
+
+    ["bay2Right:VCC", "esp32:VIN", "red", []],
+    ["bay2Right:GND", "esp32:GND.2", "black", []],
+    ["bay2Right:TRIG", "esp32:D4", "green", []],
+    ["bay2Right:ECHO", "esp32:VP", "yellow", []],
+
+    ["esp32:D12", "rR:1", "purple", []],
+    ["rR:2", "led:R", "purple", []],
+    ["esp32:D13", "rG:1", "purple", []],
+    ["rG:2", "led:G", "purple", []],
+    ["esp32:D14", "rB:1", "purple", []],
+    ["rB:2", "led:B", "purple", []],
+    ["led:COM", "esp32:GND.2", "black", []],
+
+    ["esp32:TX2", "r2R:1", "purple", []],
+    ["r2R:2", "led2:R", "purple", []],
+    ["esp32:D23", "r2G:1", "purple", []],
+    ["r2G:2", "led2:G", "purple", []],
+    ["led2:COM", "esp32:GND.2", "black", []],
+
+    ["plate:VCC", "esp32:3V3", "red", []],
+    ["plate:GND", "esp32:GND.1", "black", []],
+    ["plate:SDA", "esp32:D21", "blue", []],
+    ["plate:SCL", "esp32:D22", "orange", []],
+
+    ["plateExit:VCC", "esp32:3V3", "red", []],
+    ["plateExit:GND", "esp32:GND.2", "black", []],
+    ["plateExit:SDA", "esp32:D26", "blue", []],
+    ["plateExit:SCL", "esp32:D32", "orange", []],
+
+    ["gateServo:PWM", "esp32:D18", "green", []],
+    ["gateServo:V+", "esp32:VIN", "red", []],
+    ["gateServo:GND", "esp32:GND.2", "black", []],
+
+    ["buzzer:2", "esp32:D19", "green", []],
+    ["buzzer:1", "esp32:GND.1", "black", []],
+
+    ["buzzer2:2", "esp32:D5", "green", []],
+    ["buzzer2:1", "esp32:GND.2", "black", []],
+
+    ["esp32:RX2", "rGate:1", "purple", []],
+    ["rGate:2", "gateLed:A", "purple", []],
+    ["gateLed:C", "esp32:GND.1", "black", []]
+  ]
+}

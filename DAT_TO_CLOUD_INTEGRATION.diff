@@ -1,0 +1,672 @@
+--- /mnt/data/dat_repo/3707ICT-Automated-Smart-Parking-Dat/project.ino	2026-09-11 13:09:07.000000000 +0000
++++ /mnt/data/Smart_Parking_Dat_Cloud_Integrated/project.ino	2026-09-12 16:43:09.454267147 +0000
+@@ -45,6 +45,18 @@
+ 
+ #include <Wire.h>
+ #include <ESP32Servo.h>
++#include <WiFi.h>
++#include <WiFiClientSecure.h>
++#include <PubSubClient.h>
++#include <ArduinoJson.h>
++#include <HTTPClient.h>
++#include <time.h>
++
++#include "secrets.h"
++#include "cloud_config.h"
++
++// cloud_config.h must be included before this Blynk header.
++#include <BlynkSimpleEsp32_SSL.h>
+ 
+ // GPIO pins - must match diagram.json's wiring
+ const uint8_t ECHO_SHARED_PIN = 36; // VP - shared by all 6 sensors, see note above
+@@ -100,6 +112,8 @@
+ const uint32_t OVERSTAY_MS = 10000; // how long all-blocked must hold before it's an "overstay"
+ uint32_t blockedSince = 0;          // Bay 1: millis() when all-blocked started; 0 = not currently blocked
+ uint32_t bay2BlockedSince = 0;      // Bay 2: same, independent timer
++bool bay1OverstayActive = false;     // exported to cloud telemetry
++bool bay2OverstayActive = false;     // exported to cloud telemetry
+ 
+ // --- pressure plate tuning (entry) ---
+ const int16_t  PRESSURE_DELTA_THRESHOLD = 120; // raw ADC counts above baseline = "pressed"
+@@ -325,6 +339,443 @@
+   }
+ }
+ 
++
++// ============================================================================
++// SNAY'S CLOUD INTEGRATION MODULE
++// ============================================================================
++//
++// Proven communication path from the cloud-module prototype:
++//   - MQTT over verified TLS -> Blynk V0-V7
++//   - HTTPS over verified TLS -> Blynk V8-V14
++//   - Event-driven updates for important state changes
++//   - 30 second full-state heartbeat for re-synchronisation/history
++//   - Local parking control remains authoritative if cloud connectivity fails
++//
++// IMPORTANT ROLE BOUNDARY:
++// Dat/Aasman's local controller decides occupancy, gate behaviour, overstay,
++// capacity, and faults.  This cloud layer only reports those decisions.
++// ============================================================================
++
++struct ParkingTelemetry {
++  bool bay1Occupied = false;          // V0
++  bool bay2Occupied = false;          // V1
++  int availableSpaces = 2;            // V2
++  int gateState = 0;                  // V3: 0 closed, 1 entry, 2 exit, 3 wait-close, 4 locked-full
++  uint32_t bay1DurationSec = 0;        // V4
++  uint32_t bay2DurationSec = 0;        // V5
++  bool entryPlate = false;             // V6
++  bool exitPlate = false;              // V7
++  bool fullCapacity = false;           // V8
++  bool bay1Overstay = false;           // V9
++  bool bay2Overstay = false;           // V10
++  bool sensorFault = false;            // V11 (reserved for Aasman's fault detector)
++  int wifiRSSI = -120;                 // V12
++  String systemStatus = "OFFLINE";     // V13
++  String alertMessage = "NONE";        // V14
++};
++
++ParkingTelemetry telemetry;
++
++struct MqttEventState {
++  bool bay1Occupied = false;
++  bool bay2Occupied = false;
++  int availableSpaces = 2;
++  int gateState = 0;
++  bool entryPlate = false;
++  bool exitPlate = false;
++};
++
++struct HttpsEventState {
++  bool fullCapacity = false;
++  bool bay1Overstay = false;
++  bool bay2Overstay = false;
++  bool sensorFault = false;
++  String systemStatus = "OFFLINE";
++  String alertMessage = "NONE";
++};
++
++MqttEventState lastMqttState;
++HttpsEventState lastHttpsState;
++bool mqttStateValid = false;
++bool httpsStateValid = false;
++
++WiFiClientSecure mqttTlsClient;
++WiFiClientSecure httpsTlsClient;
++PubSubClient mqttClient(mqttTlsClient);
++
++bool wifiWasConnected = false;
++bool timeSyncStarted = false;
++bool timeIsValid = false;
++uint32_t lastWiFiRetry = 0;
++uint32_t lastMQTTRetry = 0;
++uint32_t lastCloudPublish = 0;
++
++const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
++const uint32_t MQTT_RETRY_INTERVAL_MS = 10000;
++const uint32_t CLOUD_HEARTBEAT_INTERVAL_MS = 30000;
++
++String urlEncode(const String &value) {
++  String encoded = "";
++  const char hex[] = "0123456789ABCDEF";
++
++  for (size_t i = 0; i < value.length(); ++i) {
++    unsigned char c = static_cast<unsigned char>(value.charAt(i));
++    if ((c >= 'a' && c <= 'z') ||
++        (c >= 'A' && c <= 'Z') ||
++        (c >= '0' && c <= '9') ||
++        c == '-' || c == '_' || c == '.' || c == '~') {
++      encoded += static_cast<char>(c);
++    } else {
++      encoded += '%';
++      encoded += hex[(c >> 4) & 0x0F];
++      encoded += hex[c & 0x0F];
++    }
++  }
++  return encoded;
++}
++
++void startWiFi() {
++  Serial.println("[CLOUD] Starting Wi-Fi...");
++  WiFi.mode(WIFI_STA);
++
++  // Wokwi-GUEST uses channel 6.  For real hardware, change secrets.h.
++  if (String(WIFI_SSID) == "Wokwi-GUEST") {
++    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 6);
++  } else {
++    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
++  }
++}
++
++void maintainWiFi() {
++  if (WiFi.status() == WL_CONNECTED) {
++    telemetry.wifiRSSI = WiFi.RSSI();
++    if (!wifiWasConnected) {
++      wifiWasConnected = true;
++      telemetry.systemStatus = "DEGRADED"; // MQTT may still be connecting
++      Serial.printf("[CLOUD] Wi-Fi connected | IP %s | RSSI %d dBm\n",
++                    WiFi.localIP().toString().c_str(), telemetry.wifiRSSI);
++    }
++    return;
++  }
++
++  telemetry.wifiRSSI = -120;
++  telemetry.systemStatus = "OFFLINE";
++
++  if (wifiWasConnected) {
++    wifiWasConnected = false;
++    if (mqttClient.connected()) mqttClient.disconnect();
++    timeSyncStarted = false;
++    timeIsValid = false;
++    mqttStateValid = false;
++    httpsStateValid = false;
++    Serial.println("[CLOUD] Wi-Fi lost. Local parking control continues.");
++  }
++
++  uint32_t now = millis();
++  if (now - lastWiFiRetry >= WIFI_RETRY_INTERVAL_MS) {
++    lastWiFiRetry = now;
++    Serial.println("[CLOUD] Retrying Wi-Fi...");
++    WiFi.disconnect();
++    if (String(WIFI_SSID) == "Wokwi-GUEST") {
++      WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 6);
++    } else {
++      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
++    }
++  }
++}
++
++void maintainTimeSync() {
++  if (WiFi.status() != WL_CONNECTED) return;
++
++  if (!timeSyncStarted) {
++    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
++    timeSyncStarted = true;
++    Serial.println("[CLOUD] NTP time sync started...");
++  }
++
++  if (timeIsValid) return;
++  time_t now = time(nullptr);
++  if (now > 1700000000) {
++    timeIsValid = true;
++    Serial.println("[CLOUD] System time synchronised for TLS validation.");
++  }
++}
++
++void mqttCallback(char *topic, byte *payload, unsigned int length) {
++  Serial.print("[CLOUD] MQTT RX [");
++  Serial.print(topic);
++  Serial.print("]: ");
++  for (unsigned int i = 0; i < length; ++i) Serial.print((char)payload[i]);
++  Serial.println();
++}
++
++void publishDeviceInfo() {
++  if (!mqttClient.connected()) return;
++
++  JsonDocument doc;
++  doc["tmpl"] = BLYNK_TEMPLATE_ID;
++  doc["ver"] = FIRMWARE_VERSION;
++  doc["build"] = String(__DATE__) + " " + String(__TIME__);
++  doc["type"] = BLYNK_TEMPLATE_ID;
++  doc["rxbuff"] = 1024;
++
++  char payload[256];
++  if (serializeJson(doc, payload, sizeof(payload)) == 0) return;
++  mqttClient.publish("info/mcu", payload);
++}
++
++bool publishMqttTelemetry() {
++  if (!mqttClient.connected()) return false;
++
++  JsonDocument doc;
++  doc["Bay1Occupied"] = telemetry.bay1Occupied ? 1 : 0;
++  doc["Bay2Occupied"] = telemetry.bay2Occupied ? 1 : 0;
++  doc["AvailableSpaces"] = telemetry.availableSpaces;
++  doc["GateState"] = telemetry.gateState;
++  doc["Bay1DurationSec"] = telemetry.bay1DurationSec;
++  doc["Bay2DurationSec"] = telemetry.bay2DurationSec;
++  doc["EntryPlate"] = telemetry.entryPlate ? 1 : 0;
++  doc["ExitPlate"] = telemetry.exitPlate ? 1 : 0;
++
++  char payload[512];
++  if (serializeJson(doc, payload, sizeof(payload)) == 0) return false;
++
++  bool ok = mqttClient.publish("batch_ds", payload);
++  if (!ok) Serial.println("[CLOUD] MQTT V0-V7 publish failed.");
++  return ok;
++}
++
++bool publishHttpsTelemetry() {
++  if (WiFi.status() != WL_CONNECTED || !timeIsValid) return false;
++
++  String url = "https://" + String(BLYNK_MQTT_HOST) +
++               "/external/api/batch/update?token=" + urlEncode(String(BLYNK_AUTH_TOKEN));
++
++  url += "&v8="  + String(telemetry.fullCapacity ? 1 : 0);
++  url += "&v9="  + String(telemetry.bay1Overstay ? 1 : 0);
++  url += "&v10=" + String(telemetry.bay2Overstay ? 1 : 0);
++  url += "&v11=" + String(telemetry.sensorFault ? 1 : 0);
++  url += "&v12=" + String(telemetry.wifiRSSI);
++  url += "&v13=" + urlEncode(telemetry.systemStatus);
++  url += "&v14=" + urlEncode(telemetry.alertMessage);
++
++  HTTPClient http;
++  // Keep cloud failures from stalling the local controller for a long time.
++  http.setTimeout(1500);
++
++  if (!http.begin(httpsTlsClient, url)) {
++    Serial.println("[CLOUD] HTTPS setup failed.");
++    return false;
++  }
++
++  int code = http.GET();
++  bool ok = code >= 200 && code < 300;
++  if (!ok) {
++    Serial.printf("[CLOUD] HTTPS V8-V14 failed, code %d\n", code);
++    String body = http.getString();
++    if (body.length()) Serial.println(body);
++  }
++  http.end();
++  return ok;
++}
++
++bool mqttEventChanged() {
++  if (!mqttStateValid) return true;
++  return telemetry.bay1Occupied != lastMqttState.bay1Occupied ||
++         telemetry.bay2Occupied != lastMqttState.bay2Occupied ||
++         telemetry.availableSpaces != lastMqttState.availableSpaces ||
++         telemetry.gateState != lastMqttState.gateState ||
++         telemetry.entryPlate != lastMqttState.entryPlate ||
++         telemetry.exitPlate != lastMqttState.exitPlate;
++}
++
++bool httpsEventChanged() {
++  if (!httpsStateValid) return true;
++  return telemetry.fullCapacity != lastHttpsState.fullCapacity ||
++         telemetry.bay1Overstay != lastHttpsState.bay1Overstay ||
++         telemetry.bay2Overstay != lastHttpsState.bay2Overstay ||
++         telemetry.sensorFault != lastHttpsState.sensorFault ||
++         telemetry.systemStatus != lastHttpsState.systemStatus ||
++         telemetry.alertMessage != lastHttpsState.alertMessage;
++}
++
++void rememberMqttState() {
++  lastMqttState.bay1Occupied = telemetry.bay1Occupied;
++  lastMqttState.bay2Occupied = telemetry.bay2Occupied;
++  lastMqttState.availableSpaces = telemetry.availableSpaces;
++  lastMqttState.gateState = telemetry.gateState;
++  lastMqttState.entryPlate = telemetry.entryPlate;
++  lastMqttState.exitPlate = telemetry.exitPlate;
++  mqttStateValid = true;
++}
++
++void rememberHttpsState() {
++  lastHttpsState.fullCapacity = telemetry.fullCapacity;
++  lastHttpsState.bay1Overstay = telemetry.bay1Overstay;
++  lastHttpsState.bay2Overstay = telemetry.bay2Overstay;
++  lastHttpsState.sensorFault = telemetry.sensorFault;
++  lastHttpsState.systemStatus = telemetry.systemStatus;
++  lastHttpsState.alertMessage = telemetry.alertMessage;
++  httpsStateValid = true;
++}
++
++void publishCloudSnapshot() {
++  bool mqttOK = publishMqttTelemetry();
++  if (mqttOK) rememberMqttState();
++
++  if (mqttClient.connected()) mqttClient.loop();
++
++  bool httpsOK = publishHttpsTelemetry();
++  if (httpsOK) rememberHttpsState();
++
++  Serial.printf("[CLOUD] Heartbeat -> MQTT:%s HTTPS:%s\n",
++                mqttOK ? "OK" : "FAIL", httpsOK ? "OK" : "FAIL");
++}
++
++void setupCloudClients() {
++  mqttTlsClient.setCACert(BLYNK_DEFAULT_ROOT_CA);
++  httpsTlsClient.setCACert(BLYNK_DEFAULT_ROOT_CA);
++  mqttTlsClient.setHandshakeTimeout(10);
++  httpsTlsClient.setHandshakeTimeout(10);
++
++  mqttClient.setServer(BLYNK_MQTT_HOST, BLYNK_MQTT_PORT);
++  mqttClient.setCallback(mqttCallback);
++  mqttClient.setKeepAlive(45);
++  mqttClient.setBufferSize(1024);
++  mqttClient.setSocketTimeout(3);
++
++  startWiFi();
++}
++
++void connectMQTT() {
++  if (WiFi.status() != WL_CONNECTED || !timeIsValid || mqttClient.connected()) return;
++
++  uint32_t now = millis();
++  if (lastMQTTRetry != 0 && now - lastMQTTRetry < MQTT_RETRY_INTERVAL_MS) return;
++  lastMQTTRetry = now;
++
++  Serial.printf("[CLOUD] Connecting MQTT -> %s:%u\n", BLYNK_MQTT_HOST, BLYNK_MQTT_PORT);
++
++  bool connected = mqttClient.connect(
++      "smart-parking-integrated",
++      "device",
++      BLYNK_AUTH_TOKEN);
++
++  if (connected) {
++    telemetry.systemStatus = "ONLINE";
++    Serial.println("[CLOUD] MQTT connected.");
++    mqttClient.subscribe("downlink/#");
++    publishDeviceInfo();
++    mqttStateValid = false;
++    httpsStateValid = false;
++    publishCloudSnapshot();
++    lastCloudPublish = millis();
++  } else {
++    telemetry.systemStatus = "DEGRADED";
++    Serial.printf("[CLOUD] MQTT connect failed, state=%d. Local control continues.\n",
++                  mqttClient.state());
++  }
++}
++
++void maintainMQTT() {
++  if (WiFi.status() != WL_CONNECTED || !timeIsValid) return;
++
++  if (!mqttClient.connected()) {
++    telemetry.systemStatus = "DEGRADED";
++    connectMQTT();
++    return;
++  }
++
++  telemetry.systemStatus = "ONLINE";
++  mqttClient.loop();
++}
++
++void publishChangedTelemetry() {
++  if (WiFi.status() != WL_CONNECTED || !timeIsValid) return;
++
++  if (mqttClient.connected() && mqttEventChanged()) {
++    if (publishMqttTelemetry()) {
++      rememberMqttState();
++      Serial.println("[CLOUD] Immediate MQTT state update sent.");
++    }
++  }
++
++  if (httpsEventChanged()) {
++    if (publishHttpsTelemetry()) {
++      rememberHttpsState();
++      Serial.println("[CLOUD] Immediate HTTPS state update sent.");
++    }
++  }
++}
++
++void maintainCloudHeartbeat() {
++  if (WiFi.status() != WL_CONNECTED || !timeIsValid) return;
++  uint32_t now = millis();
++  if (now - lastCloudPublish >= CLOUD_HEARTBEAT_INTERVAL_MS) {
++    lastCloudPublish = now;
++    publishCloudSnapshot();
++  }
++}
++
++// Maps Dat/Aasman's authoritative controller state into Snay's cloud contract.
++void syncTelemetryFromController(bool bay1Occupied,
++                                 bool bay2Occupied,
++                                 bool bay1Overstay,
++                                 bool bay2Overstay) {
++  telemetry.bay1Occupied = bay1Occupied;
++  telemetry.bay2Occupied = bay2Occupied;
++  telemetry.availableSpaces = 2 - (bay1Occupied ? 1 : 0) - (bay2Occupied ? 1 : 0);
++  telemetry.fullCapacity = bothBaysFull;
++  telemetry.entryPlate = plateActive;
++  telemetry.exitPlate = plateExitActive;
++  telemetry.bay1Overstay = bay1Overstay;
++  telemetry.bay2Overstay = bay2Overstay;
++
++  telemetry.bay1DurationSec =
++      (bay1Occupied && blockedSince != 0) ? (millis() - blockedSince) / 1000UL : 0;
++  telemetry.bay2DurationSec =
++      (bay2Occupied && bay2BlockedSince != 0) ? (millis() - bay2BlockedSince) / 1000UL : 0;
++
++  // Gate state mapping used by Blynk V3.
++  if (gateOpen) {
++    if (gateHoldUntil != 0) telemetry.gateState = 3;          // WAITING_TO_CLOSE
++    else telemetry.gateState = gateForExit ? 2 : 1;          // OPEN_EXIT / OPEN_ENTRY
++  } else if (bothBaysFull) {
++    telemetry.gateState = 4;                                  // LOCKED_FULL
++  } else {
++    telemetry.gateState = 0;                                  // CLOSED
++  }
++
++  // Dat's current code has no authoritative fault detector yet.
++  // Keep false until Aasman's fault-detection output is wired here.
++  telemetry.sensorFault = false;
++
++  if (telemetry.sensorFault) {
++    telemetry.alertMessage = "SENSOR FAULT";
++  } else if (entryRefusedLatched) {
++    telemetry.alertMessage = "ENTRY REFUSED - FULL";
++  } else if (bay1Overstay && bay2Overstay) {
++    telemetry.alertMessage = "BOTH BAYS OVERSTAY";
++  } else if (bay1Overstay) {
++    telemetry.alertMessage = "BAY 1 OVERSTAY";
++  } else if (bay2Overstay) {
++    telemetry.alertMessage = "BAY 2 OVERSTAY";
++  } else if (bothBaysFull) {
++    telemetry.alertMessage = "CAR PARK FULL";
++  } else {
++    telemetry.alertMessage = "NONE";
++  }
++}
++
++void serviceCloud() {
++  maintainWiFi();
++  maintainTimeSync();
++  maintainMQTT();
++  publishChangedTelemetry();
++  maintainCloudHeartbeat();
++}
++
++
+ void setup() {
+   Serial.begin(115200);
+ 
+@@ -356,98 +807,114 @@
+   gateServo.setPeriodHertz(50);
+   gateServo.attach(GATE_SERVO_PIN, 500, 2500);
+   gateServo.write(GATE_CLOSED_ANGLE);
++
++  // Start Snay's cloud subsystem after all local hardware is initialised.
++  setupCloudClients();
++  Serial.println("[SYSTEM] Local parking controller started; cloud is best-effort.");
+ }
+ 
++
+ void loop() {
+   uint32_t now = millis();
+-  if (now - lastReadAt < READ_INTERVAL_MS) return;
+-  lastReadAt = now;
+ 
+-  float topDistance   = readDistanceCm(TOP_TRIG_PIN);
+-  float leftDistance  = readDistanceCm(LEFT_TRIG_PIN);
+-  float rightDistance = readDistanceCm(RIGHT_TRIG_PIN);
+-
+-  bool topBlocked   = isBlocked(topDistance);
+-  bool leftBlocked  = isBlocked(leftDistance);
+-  bool rightBlocked = isBlocked(rightDistance);
+-  bool allBlocked   = topBlocked && leftBlocked && rightBlocked;
+-
+-  const char *ledLabel;
+-  if (allBlocked) {
+-    if (blockedSince == 0) blockedSince = now; // just became blocked - start the overstay clock
+-
+-    bool overstay = (now - blockedSince) >= OVERSTAY_MS;
+-    if (overstay) {
+-      setColor(true, true, false);   // yellow
+-      setBuzzer(true);
+-      ledLabel = "YELLOW (overstay)";
++  // Local parking logic always gets first priority when its 150 ms cycle is due.
++  if (now - lastReadAt >= READ_INTERVAL_MS) {
++    lastReadAt = now;
++
++    float topDistance   = readDistanceCm(TOP_TRIG_PIN);
++    float leftDistance  = readDistanceCm(LEFT_TRIG_PIN);
++    float rightDistance = readDistanceCm(RIGHT_TRIG_PIN);
++
++    bool topBlocked   = isBlocked(topDistance);
++    bool leftBlocked  = isBlocked(leftDistance);
++    bool rightBlocked = isBlocked(rightDistance);
++    bool allBlocked   = topBlocked && leftBlocked && rightBlocked;
++
++    const char *ledLabel;
++    if (allBlocked) {
++      if (blockedSince == 0) blockedSince = now;
++
++      bay1OverstayActive = (now - blockedSince) >= OVERSTAY_MS;
++      if (bay1OverstayActive) {
++        setColor(true, true, false);
++        setBuzzer(true);
++        ledLabel = "YELLOW (overstay)";
++      } else {
++        setColor(true, false, false);
++        setBuzzer(false);
++        ledLabel = "RED";
++      }
+     } else {
+-      setColor(true, false, false);  // red
++      blockedSince = 0;
++      bay1OverstayActive = false;
++      setColor(false, true, false);
+       setBuzzer(false);
+-      ledLabel = "RED";
++      ledLabel = "GREEN";
+     }
+-  } else {
+-    blockedSince = 0; // reset - the moment anything clears, overstay is over
+-    setColor(false, true, false);    // green
+-    setBuzzer(false);
+-    ledLabel = "GREEN";
+-  }
+-
+-  Serial.printf("Bay1 Top: %.1f cm (%s) | Left: %.1f cm (%s) | Right: %.1f cm (%s) -> LED %s\n",
+-                topDistance,   topBlocked   ? "blocked" : "clear",
+-                leftDistance,  leftBlocked  ? "blocked" : "clear",
+-                rightDistance, rightBlocked ? "blocked" : "clear",
+-                ledLabel);
+-
+-  // --- Bay 2: same rule as Bay 1 (including overstay -> yellow), on its own
+-  // LED, its own timer, and its own buzzer. ---
+-  float bay2TopDistance   = readDistanceCm(BAY2_TOP_TRIG_PIN);
+-  float bay2LeftDistance  = readDistanceCm(BAY2_LEFT_TRIG_PIN);
+-  float bay2RightDistance = readDistanceCm(BAY2_RIGHT_TRIG_PIN);
+-
+-  bool bay2TopBlocked   = isBlocked(bay2TopDistance);
+-  bool bay2LeftBlocked  = isBlocked(bay2LeftDistance);
+-  bool bay2RightBlocked = isBlocked(bay2RightDistance);
+-  bool bay2AllBlocked   = bay2TopBlocked && bay2LeftBlocked && bay2RightBlocked;
+-
+-  const char *led2Label;
+-  if (bay2AllBlocked) {
+-    if (bay2BlockedSince == 0) bay2BlockedSince = now;
+-
+-    bool bay2Overstay = (now - bay2BlockedSince) >= OVERSTAY_MS;
+-    if (bay2Overstay) {
+-      setColor2(true, true);   // yellow
+-      setBuzzer2(true);
+-      led2Label = "YELLOW (overstay)";
++
++    Serial.printf("Bay1 Top: %.1f cm (%s) | Left: %.1f cm (%s) | Right: %.1f cm (%s) -> LED %s\n",
++                  topDistance,   topBlocked   ? "blocked" : "clear",
++                  leftDistance,  leftBlocked  ? "blocked" : "clear",
++                  rightDistance, rightBlocked ? "blocked" : "clear",
++                  ledLabel);
++
++    float bay2TopDistance   = readDistanceCm(BAY2_TOP_TRIG_PIN);
++    float bay2LeftDistance  = readDistanceCm(BAY2_LEFT_TRIG_PIN);
++    float bay2RightDistance = readDistanceCm(BAY2_RIGHT_TRIG_PIN);
++
++    bool bay2TopBlocked   = isBlocked(bay2TopDistance);
++    bool bay2LeftBlocked  = isBlocked(bay2LeftDistance);
++    bool bay2RightBlocked = isBlocked(bay2RightDistance);
++    bool bay2AllBlocked   = bay2TopBlocked && bay2LeftBlocked && bay2RightBlocked;
++
++    const char *led2Label;
++    if (bay2AllBlocked) {
++      if (bay2BlockedSince == 0) bay2BlockedSince = now;
++
++      bay2OverstayActive = (now - bay2BlockedSince) >= OVERSTAY_MS;
++      if (bay2OverstayActive) {
++        setColor2(true, true);
++        setBuzzer2(true);
++        led2Label = "YELLOW (overstay)";
++      } else {
++        setColor2(true, false);
++        setBuzzer2(false);
++        led2Label = "RED";
++      }
+     } else {
+-      setColor2(true, false);  // red
++      bay2BlockedSince = 0;
++      bay2OverstayActive = false;
++      setColor2(false, true);
+       setBuzzer2(false);
+-      led2Label = "RED";
++      led2Label = "GREEN";
+     }
+-  } else {
+-    bay2BlockedSince = 0;
+-    setColor2(false, true);    // green
+-    setBuzzer2(false);
+-    led2Label = "GREEN";
+-  }
+-
+-  Serial.printf("Bay2 Top: %.1f cm (%s) | Left: %.1f cm (%s) | Right: %.1f cm (%s) -> LED2 %s\n",
+-                bay2TopDistance,   bay2TopBlocked   ? "blocked" : "clear",
+-                bay2LeftDistance,  bay2LeftBlocked  ? "blocked" : "clear",
+-                bay2RightDistance, bay2RightBlocked ? "blocked" : "clear",
+-                led2Label);
+-
+-  // Now that both bays' occupancy is known for this cycle, capacity lockout
+-  // can be evaluated before the gate/plate logic runs.
+-  bothBaysFull = allBlocked && bay2AllBlocked;
+-
+-  servicePlate();
+-  servicePlateExit();
+-  serviceGate();
+-  serviceGateLed();
+-
+-  Serial.printf("Entry plate delta: %d / %d%s | Exit plate delta: %d / %d%s%s\n",
+-                plateLastDelta, PRESSURE_DELTA_THRESHOLD, plateActive ? " (PRESSED)" : "",
+-                plateExitLastDelta, PRESSURE_DELTA_THRESHOLD, plateExitActive ? " (PRESSED)" : "",
+-                bothBaysFull ? " | CAPACITY FULL" : "");
++
++    Serial.printf("Bay2 Top: %.1f cm (%s) | Left: %.1f cm (%s) | Right: %.1f cm (%s) -> LED2 %s\n",
++                  bay2TopDistance,   bay2TopBlocked   ? "blocked" : "clear",
++                  bay2LeftDistance,  bay2LeftBlocked  ? "blocked" : "clear",
++                  bay2RightDistance, bay2RightBlocked ? "blocked" : "clear",
++                  led2Label);
++
++    // Controller-owned capacity state.
++    bothBaysFull = allBlocked && bay2AllBlocked;
++
++    servicePlate();
++    servicePlateExit();
++    serviceGate();
++    serviceGateLed();
++
++    Serial.printf("Entry plate delta: %d / %d%s | Exit plate delta: %d / %d%s%s\n",
++                  plateLastDelta, PRESSURE_DELTA_THRESHOLD, plateActive ? " (PRESSED)" : "",
++                  plateExitLastDelta, PRESSURE_DELTA_THRESHOLD, plateExitActive ? " (PRESSED)" : "",
++                  bothBaysFull ? " | CAPACITY FULL" : "");
++
++    // Export the controller's authoritative state to Snay's cloud layer.
++    syncTelemetryFromController(allBlocked,
++                                bay2AllBlocked,
++                                bay1OverstayActive,
++                                bay2OverstayActive);
++  }
++
++  // Best-effort network/cloud servicing occurs after local control work.
++  serviceCloud();
+ }
