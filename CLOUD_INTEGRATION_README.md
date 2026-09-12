@@ -30,10 +30,10 @@ This package preserves Dat's six-ultrasonic / two-pressure-plate / servo / LED /
 
 ## Before running
 
-1. Put the Blynk device Auth Token in `secrets.h`.
-2. Do not commit `secrets.h`; `.gitignore` already excludes it.
+1. The repository includes `include/secrets.h` with the dedicated Wokwi test Auth Token.
+2. Replace the test values locally when using physical hardware, and do not commit production credentials.
 3. The Blynk template ID and region are in `cloud_config.h`.
-4. `libraries.txt` now includes ESP32Servo, PubSubClient, ArduinoJson and Blynk.
+4. `platformio.ini` declares ESP32Servo, PubSubClient, ArduinoJson and Blynk.
 
 ## Design notes
 
