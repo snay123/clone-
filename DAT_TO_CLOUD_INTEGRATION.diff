@@ -139,7 +139,7 @@
 +  }
 +}
 +
-+void maintainWiFi() {
++void WiFi() {
 +  if (WiFi.status() == WL_CONNECTED) {
 +    telemetry.wifiRSSI = WiFi.RSSI();
 +    if (!wifiWasConnected) {
@@ -177,7 +177,7 @@
 +  }
 +}
 +
-+void maintainTimeSync() {
++void TimeSync() {
 +  if (WiFi.status() != WL_CONNECTED) return;
 +
 +  if (!timeSyncStarted) {
@@ -370,7 +370,7 @@
 +  }
 +}
 +
-+void maintainMQTT() {
++void MQTT() {
 +  if (WiFi.status() != WL_CONNECTED || !timeIsValid) return;
 +
 +  if (!mqttClient.connected()) {
@@ -401,7 +401,7 @@
 +  }
 +}
 +
-+void maintainCloudHeartbeat() {
++void CloudHeartbeat() {
 +  if (WiFi.status() != WL_CONNECTED || !timeIsValid) return;
 +  uint32_t now = millis();
 +  if (now - lastCloudPublish >= CLOUD_HEARTBEAT_INTERVAL_MS) {
@@ -461,11 +461,11 @@
 +}
 +
 +void serviceCloud() {
-+  maintainWiFi();
-+  maintainTimeSync();
-+  maintainMQTT();
++  WiFi();
++  TimeSync();
++  MQTT();
 +  publishChangedTelemetry();
-+  maintainCloudHeartbeat();
++  CloudHeartbeat();
 +}
 +
 +
